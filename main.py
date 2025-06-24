@@ -6,6 +6,9 @@ from fast_flights import FlightData, Passengers, get_flights
 import logging
 import re
 import pandas as pd
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 # from datetime import date as dt_date
 
 # Helper functions for parsing price and stops
@@ -44,6 +47,15 @@ class HotelSearchRequest(BaseModel):
     fetch_mode: str = Field("live", description="'live' for scraping, 'local' for mock data", examples=["live"])
     limit: int = Field(3, ge=1, description="Maximum number of hotel results to return", examples=[3])
     debug: bool = Field(False, description="Enable debug mode for scraping", examples=[False])
+    
+    @field_validator('checkin_date')
+    def checkin_date_not_in_past(cls, v):
+        import datetime
+        checkin = datetime.datetime.strptime(v, "%Y-%m-%d").date()
+        today = datetime.date.today()
+        if checkin < today:
+            raise ValueError("checkin_date cannot be in the past.")
+        return v
 
 class HotelInfo(BaseModel):
     name: str = Field(..., description="Hotel name")
@@ -118,6 +130,15 @@ class TripPlanResponse(BaseModel):
     breakdown: Dict[str, Any] = Field(..., description="Breakdown of costs and trip details")
     suggestions: Optional[str] = Field(None, description="Suggestions for optimizing the trip or saving money")
 
+executor = ThreadPoolExecutor()
+
+def _run_blocking(func, *args, **kwargs):
+    return func(*args, **kwargs)
+
+async def run_blocking(func, *args, **kwargs):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(executor, _run_blocking, func, *args, **kwargs)
+
 @app.post("/hotels/search", response_model=HotelSearchResponse)
 def search_hotels(req: HotelSearchRequest):
     try:
@@ -191,122 +212,108 @@ def search_flights(req: FlightSearchRequest):
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/trip/plan", response_model=TripPlanResponse)
-def plan_trip(req: TripPlanRequest):
+async def plan_trip(req: TripPlanRequest):
     try:
-        # Search for outbound flight (always one-way)
-        try:
-            passengers = Passengers(
-                adults=req.adults,
-                children=req.children,
-                infants_in_seat=0,
-                infants_on_lap=0
-            )
-            outbound_flight_data = [FlightData(
-                date=req.depart_date,
-                from_airport=req.origin,
-                to_airport=req.destination
-            )]
-            outbound_result = get_flights(
-                flight_data=outbound_flight_data,
-                trip="one-way",
-                seat="economy",
-                passengers=passengers,
-                fetch_mode="local"
-            )
-            outbound_flights = [
-                FlightInfo(
-                    name=f.name,
-                    departure=f.departure,
-                    arrival=f.arrival,
-                    arrival_time_ahead=getattr(f, 'arrival_time_ahead', None),
-                    duration=getattr(f, 'duration', None),
-                    stops=_parse_stops(getattr(f, 'stops', None)),
-                    delay=getattr(f, 'delay', None),
-                    price=_parse_price(getattr(f, 'price', None)),
-                    is_best=getattr(f, 'is_best', None)
-                ) for f in outbound_result.flights
-            ]
-            best_outbound_flight = min((f for f in outbound_flights if f.price is not None), key=lambda x: x.price, default=None)
-        except Exception as e:
-            logging.error(f"Outbound flight search error in /trip/plan: {e}")
-            raise HTTPException(status_code=502, detail=f"Outbound flight search failed: {e}")
-
-        # Search for return flight using all trip types if return_date is provided
-        best_return_flight = None
+        passengers = Passengers(
+            adults=req.adults,
+            children=req.children,
+            infants_in_seat=0,
+            infants_on_lap=0
+        )
+        outbound_flight_data = [FlightData(
+            date=req.depart_date,
+            from_airport=req.origin,
+            to_airport=req.destination
+        )]
+        hotel_data = [HotelData(
+            checkin_date=req.depart_date,
+            checkout_date=req.return_date if getattr(req, 'return_date', None) else req.depart_date,
+            location=req.destination
+        )]
+        return_flight_data = None
+        trip_types = []
         if getattr(req, 'return_date', None):
-            best_price = float('inf')
-            for trip_type in ["one-way", "round-trip", "multi-city"]:
-                try:
-                    return_flight_data = [FlightData(
-                        date=req.return_date,
-                        from_airport=req.destination,
-                        to_airport=req.origin
-                    )]
-                    return_result = get_flights(
-                        flight_data=return_flight_data,
-                        trip=trip_type,
-                        seat="economy",
-                        passengers=passengers,
-                        fetch_mode="local"
-                    )
-                    return_flights = [
-                        FlightInfo(
-                            name=f.name,
-                            departure=f.departure,
-                            arrival=f.arrival,
-                            arrival_time_ahead=getattr(f, 'arrival_time_ahead', None),
-                            duration=getattr(f, 'duration', None),
-                            stops=_parse_stops(getattr(f, 'stops', None)),
-                            delay=getattr(f, 'delay', None),
-                            price=_parse_price(getattr(f, 'price', None)),
-                            is_best=getattr(f, 'is_best', None)
-                        ) for f in return_result.flights
-                    ]
-                    candidate = min((f for f in return_flights if f.price is not None), key=lambda x: x.price, default=None)
-                    if candidate and candidate.price is not None and candidate.price < best_price:
-                        best_price = candidate.price
-                        best_return_flight = candidate
-                except Exception as e:
-                    logging.warning(f"Return flight search error for trip_type {trip_type} in /trip/plan: {e}")
-        # else: best_return_flight remains None
-
-        # Search for hotels
-        try:
-            hotel_data = [HotelData(
-                checkin_date=req.depart_date,
-                checkout_date=req.return_date if getattr(req, 'return_date', None) else req.depart_date,
-                location=req.destination
+            return_flight_data = [FlightData(
+                date=req.return_date,
+                from_airport=req.destination,
+                to_airport=req.origin
             )]
-            guests = Guests(adults=req.adults, children=req.children)
-            hotel_result = get_hotels(
-                hotel_data=hotel_data,
-                guests=guests,
-                fetch_mode="live",
-                debug=False,
-                limit=10
-            )
-            hotels = [
-                HotelInfo(
-                    name=h.name,
-                    price=getattr(h, 'price', None),
-                    rating=getattr(h, 'rating', None),
-                    url=getattr(h, 'url', None),
-                    amenities=getattr(h, 'amenities', None)
-                ) for h in hotel_result.hotels
-            ]
-            # Filter hotels by preferences
-            filtered_hotels = hotels
-            if req.hotel_preferences:
-                if req.hotel_preferences.star_rating:
-                    filtered_hotels = [h for h in filtered_hotels if h.rating and h.rating >= req.hotel_preferences.star_rating]
-                if req.hotel_preferences.max_price_per_night:
-                    filtered_hotels = [h for h in filtered_hotels if h.price and h.price <= req.hotel_preferences.max_price_per_night]
-                if req.hotel_preferences.amenities:
-                    filtered_hotels = [h for h in filtered_hotels if h.amenities and all(a in h.amenities for a in req.hotel_preferences.amenities)]
-            best_hotel = min((h for h in filtered_hotels if h.price is not None), key=lambda x: x.price, default=None)
-        except Exception as e:
-            logging.error(f"Hotel search error in /trip/plan: {e}")
-            raise HTTPException(status_code=502, detail=f"Hotel search failed: {e}")
+            trip_types = ["one-way", "round-trip", "multi-city"]
+
+        tasks = [
+            run_blocking(partial(get_flights, flight_data=outbound_flight_data, trip="one-way", seat="economy", passengers=passengers, fetch_mode="local")),
+            run_blocking(partial(get_hotels, hotel_data=hotel_data, guests=Guests(adults=req.adults, children=req.children), fetch_mode="live", debug=False, limit=10))
+        ]
+        if return_flight_data:
+            for trip_type in trip_types:
+                tasks.append(run_blocking(partial(get_flights, flight_data=return_flight_data, trip=trip_type, seat="economy", passengers=passengers, fetch_mode="local")))
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        outbound_result = results[0]
+        hotel_result = results[1]
+        return_results = results[2:] if return_flight_data else []
+
+        # Outbound flight
+        outbound_flights = [
+            FlightInfo(
+                name=f.name,
+                departure=f.departure,
+                arrival=f.arrival,
+                arrival_time_ahead=getattr(f, 'arrival_time_ahead', None),
+                duration=getattr(f, 'duration', None),
+                stops=_parse_stops(getattr(f, 'stops', None)),
+                delay=getattr(f, 'delay', None),
+                price=_parse_price(getattr(f, 'price', None)),
+                is_best=getattr(f, 'is_best', None)
+            ) for f in getattr(outbound_result, 'flights', [])
+        ] if not isinstance(outbound_result, Exception) else []
+        best_outbound_flight = min((f for f in outbound_flights if f.price is not None), key=lambda x: x.price, default=None)
+
+        # Return flight (find best among all trip types)
+        best_return_flight = None
+        best_price = float('inf')
+        if return_results:
+            for idx, return_result in enumerate(return_results):
+                if isinstance(return_result, Exception):
+                    logging.warning(f"Return flight search error for trip_type {trip_types[idx]} in /trip/plan: {return_result}")
+                    continue
+                return_flights = [
+                    FlightInfo(
+                        name=f.name,
+                        departure=f.departure,
+                        arrival=f.arrival,
+                        arrival_time_ahead=getattr(f, 'arrival_time_ahead', None),
+                        duration=getattr(f, 'duration', None),
+                        stops=_parse_stops(getattr(f, 'stops', None)),
+                        delay=getattr(f, 'delay', None),
+                        price=_parse_price(getattr(f, 'price', None)),
+                        is_best=getattr(f, 'is_best', None)
+                    ) for f in getattr(return_result, 'flights', [])
+                ]
+                candidate = min((f for f in return_flights if f.price is not None), key=lambda x: x.price, default=None)
+                if candidate and candidate.price is not None and candidate.price < best_price:
+                    best_price = candidate.price
+                    best_return_flight = candidate
+
+        # Hotels
+        hotels = [
+            HotelInfo(
+                name=h.name,
+                price=getattr(h, 'price', None),
+                rating=getattr(h, 'rating', None),
+                url=getattr(h, 'url', None),
+                amenities=getattr(h, 'amenities', None)
+            ) for h in getattr(hotel_result, 'hotels', [])
+        ] if not isinstance(hotel_result, Exception) else []
+        filtered_hotels = hotels
+        if req.hotel_preferences:
+            if req.hotel_preferences.star_rating:
+                filtered_hotels = [h for h in filtered_hotels if h.rating and h.rating >= req.hotel_preferences.star_rating]
+            if req.hotel_preferences.max_price_per_night:
+                filtered_hotels = [h for h in filtered_hotels if h.price and h.price <= req.hotel_preferences.max_price_per_night]
+            if req.hotel_preferences.amenities:
+                filtered_hotels = [h for h in filtered_hotels if h.amenities and all(a in h.amenities for a in req.hotel_preferences.amenities)]
+        best_hotel = min((h for h in filtered_hotels if h.price is not None), key=lambda x: x.price, default=None)
 
         # Calculate total cost
         total_flight_cost = 0
